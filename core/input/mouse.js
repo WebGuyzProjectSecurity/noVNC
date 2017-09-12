@@ -13,10 +13,19 @@ import { isTouchDevice } from '../util/browsers.js';
 import { setCapture, stopEvent, getPointerEvent } from '../util/events.js';
 import { set_defaults, make_properties } from '../util/properties.js';
 
+var WHEEL_STEP = 10; // Delta threshold for a mouse wheel step
+var WHEEL_STEP_TIMEOUT = 50; // ms
+var WHEEL_LINE_HEIGHT = 19;
+
 export default function Mouse(defaults) {
 
     this._doubleClickTimer = null;
     this._lastTouchPos = null;
+
+    this._wheelPos = null;
+    this._wheelStepTimer = null;
+    this._accumulatedWheelDeltaX = 0;
+    this._accumulatedWheelDeltaY = 0;
 
     // Configuration attributes
     set_defaults(this, defaults, {
@@ -108,27 +117,82 @@ Mouse.prototype = {
         this._handleMouseButton(e, 0);
     },
 
+    // Mouse wheel events are sent in steps over VNC. This means that the VNC
+    // protocol can't handle a wheel event with specific distance or speed.
+    // Therefor, if we get a lot of small mouse wheel events we combine them.
+    _generateWheelStepX: function () {
+
+        if (this._accumulatedWheelDeltaX < 0) {
+            this._onMouseButton(this._wheelPos.x, this._wheelPos.y, 1, 1 << 5);
+            this._onMouseButton(this._wheelPos.x, this._wheelPos.y, 0, 1 << 5);
+        } else if (this._accumulatedWheelDeltaX > 0) {
+            this._onMouseButton(this._wheelPos.x, this._wheelPos.y, 1, 1 << 6);
+            this._onMouseButton(this._wheelPos.x, this._wheelPos.y, 0, 1 << 6);
+        }
+
+        this._accumulatedWheelDeltaX = 0;
+    },
+
+    _generateWheelStepY: function () {
+
+        if (this._accumulatedWheelDeltaY < 0) {
+            this._onMouseButton(this._wheelPos.x, this._wheelPos.y, 1, 1 << 3);
+            this._onMouseButton(this._wheelPos.x, this._wheelPos.y, 0, 1 << 3);
+        } else if (this._accumulatedWheelDeltaY > 0) {
+            this._onMouseButton(this._wheelPos.x, this._wheelPos.y, 1, 1 << 4);
+            this._onMouseButton(this._wheelPos.x, this._wheelPos.y, 0, 1 << 4);
+        }
+
+        this._accumulatedWheelDeltaY = 0;
+    },
+
+    _resetWheelStepTimers: function () {
+        window.clearTimeout(this._wheelStepXTimer);
+        window.clearTimeout(this._wheelStepYTimer);
+        this._wheelStepXTimer = null;
+        this._wheelStepYTimer = null;
+    },
+
     _handleMouseWheel: function (e) {
-        if (!this._focused) { return; }
+        if (!this._focused || !this._onMouseButton) { return; }
 
-        var pos = this._getMousePosition(e);
+        this._resetWheelStepTimers();
 
-        if (this._onMouseButton) {
-            if (e.deltaX < 0) {
-                this._onMouseButton(pos.x, pos.y, 1, 1 << 5);
-                this._onMouseButton(pos.x, pos.y, 0, 1 << 5);
-            } else if (e.deltaX > 0) {
-                this._onMouseButton(pos.x, pos.y, 1, 1 << 6);
-                this._onMouseButton(pos.x, pos.y, 0, 1 << 6);
-            }
+        this._wheelPos = this._getMousePosition(e);
 
-            if (e.deltaY < 0) {
-                this._onMouseButton(pos.x, pos.y, 1, 1 << 3);
-                this._onMouseButton(pos.x, pos.y, 0, 1 << 3);
-            } else if (e.deltaY > 0) {
-                this._onMouseButton(pos.x, pos.y, 1, 1 << 4);
-                this._onMouseButton(pos.x, pos.y, 0, 1 << 4);
-            }
+        var dX = e.deltaX;
+        var dY = e.deltaY;
+
+        // Pixel units unless it's non-zero.
+        // Note that if deltamode is line or page won't matter since we aren't
+        // sending the mouse wheel delta to the server anyway.
+        // The difference between pixel and line can be important however since
+        // we have a threshold that can be smaller than the line height.
+        if (e.deltaMode !== 0) {
+            dX *= WHEEL_LINE_HEIGHT;
+            dY *= WHEEL_LINE_HEIGHT;
+        }
+
+        this._accumulatedWheelDeltaX += dX;
+        this._accumulatedWheelDeltaY += dY;
+
+        // Generate a mouse wheel step event when the accumulated delta
+        // for one of the axes is large enough.
+        // Small delta events that do not pass the threshold get sent
+        // after a timeout.
+        if (Math.abs(this._accumulatedWheelDeltaX) > WHEEL_STEP) {
+            this._generateWheelStepX();
+        } else {
+            this._wheelStepXTimer =
+                window.setTimeout(this._generateWheelStepX.bind(this),
+                                  WHEEL_STEP_TIMEOUT);
+        }
+        if (Math.abs(this._accumulatedWheelDeltaY) > WHEEL_STEP) {
+            this._generateWheelStepY();
+        } else {
+            this._wheelStepYTimer =
+                window.setTimeout(this._generateWheelStepY.bind(this),
+                                  WHEEL_STEP_TIMEOUT);
         }
 
         stopEvent(e);
@@ -205,6 +269,8 @@ Mouse.prototype = {
 
     ungrab: function () {
         var c = this._target;
+
+        this._resetWheelStepTimers();
 
         if (isTouchDevice) {
             c.removeEventListener('touchstart', this._eventHandlers.mousedown);
